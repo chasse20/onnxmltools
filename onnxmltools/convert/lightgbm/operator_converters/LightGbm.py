@@ -2,9 +2,12 @@
 
 import copy
 import numbers
+import concurrent.futures
 from collections import deque, Counter
+from datetime import timedelta
 import ctypes
 import json
+import time
 import numpy as np
 from onnx import TensorProto
 from ...common._apply_operation import (
@@ -18,6 +21,14 @@ from ...common._registration import register_converter
 from ...common.tree_ensemble import get_default_tree_classifier_attribute_pairs
 from ....proto import onnx_proto
 
+CRITERION_MAP = {
+    "<=": "BRANCH_LEQ",
+    "<": "BRANCH_LT",
+    ">=": "BRANCH_GTE",
+    ">": "BRANCH_GT",
+    "==": "BRANCH_EQ",
+    "!=": "BRANCH_NEQ"
+}; # this is faster!
 
 def has_tqdm():
     try:
@@ -27,253 +38,100 @@ def has_tqdm():
     except ImportError:
         return False
 
-
-def _translate_split_criterion(criterion):
-    # If the criterion is true, LightGBM use the left child.
-    # Otherwise, right child is selected.
-    if criterion == "<=":
-        return "BRANCH_LEQ"
-    elif criterion == "<":
-        return "BRANCH_LT"
-    elif criterion == ">=":
-        return "BRANCH_GTE"
-    elif criterion == ">":
-        return "BRANCH_GT"
-    elif criterion == "==":
-        return "BRANCH_EQ"
-    elif criterion == "!=":
-        return "BRANCH_NEQ"
-    else:
-        raise ValueError(
-            "Unsupported splitting criterion: %s. Only <=, " "<, >=, and > are allowed."
-        )
-
-
-def _create_node_id(node_id_pool):
-    i = 0
-    while i in node_id_pool:
-        i += 1
-    node_id_pool.add(i)
-    return i
-
-
-def _parse_tree_structure(tree_id, class_id, learning_rate, tree_structure, attrs):
+def _parse_single_tree(tree, tree_id, class_id, learning_rate):
     """
-    The pool of all nodes' indexes created when parsing a single tree.
-    Different tree use different pools.
+    Parse one LightGBM tree into ONNX-TreeEnsemble attributes (partial).
+    Returns local lists of nodes_* and class_* that you can later merge.
     """
-    node_id_pool = set()
-    node_pyid_pool = dict()
+    nodes_treeids = []
+    nodes_nodeids = []
+    nodes_featureids = []
+    nodes_modes = []
+    nodes_values = []
+    nodes_truenodeids = []
+    nodes_falsenodeids = []
+    nodes_missing_value_tracks_true = []
+    nodes_hitrates = []
 
-    node_id = _create_node_id(node_id_pool)
-    node_pyid_pool[id(tree_structure)] = node_id
+    class_treeids = []
+    class_nodeids = []
+    class_ids = []
+    class_weights = []
 
-    # The root node is a leaf node.
-    if "left_child" not in tree_structure or "right_child" not in tree_structure:
-        _parse_node(
-            tree_id,
-            class_id,
-            node_id,
-            node_id_pool,
-            node_pyid_pool,
-            learning_rate,
-            tree_structure,
-            attrs,
-        )
-        return
+    # BFS queue
+    queue = deque()
+    queue.append((tree, None, None))
+    node_index_lookup = {}
+    current_node_idx = 0
 
-    left_pyid = id(tree_structure["left_child"])
-    right_pyid = id(tree_structure["right_child"])
+    while queue:
+        node_dict, parent_idx, is_true_branch = queue.popleft()
+        node_id = current_node_idx
+        current_node_idx += 1
 
-    if left_pyid in node_pyid_pool:
-        left_id = node_pyid_pool[left_pyid]
-        left_parse = False
-    else:
-        left_id = _create_node_id(node_id_pool)
-        node_pyid_pool[left_pyid] = left_id
-        left_parse = True
-
-    if right_pyid in node_pyid_pool:
-        right_id = node_pyid_pool[right_pyid]
-        right_parse = False
-    else:
-        right_id = _create_node_id(node_id_pool)
-        node_pyid_pool[right_pyid] = right_id
-        right_parse = True
-
-    attrs["nodes_treeids"].append(tree_id)
-    attrs["nodes_nodeids"].append(node_id)
-
-    attrs["nodes_featureids"].append(tree_structure["split_feature"])
-    attrs["nodes_modes"].append(
-        _translate_split_criterion(tree_structure["decision_type"])
-    )
-    if isinstance(tree_structure["threshold"], str):
-        try:
-            attrs["nodes_values"].append(float(tree_structure["threshold"]))
-        except ValueError:
-            import pprint
-
-            text = pprint.pformat(tree_structure)
-            if len(text) > 100000:
-                text = text[:100000] + "\n..."
-            raise TypeError(
-                "threshold must be a number not '{}'"
-                "\n{}".format(tree_structure["threshold"], text)
-            )
-    else:
-        attrs["nodes_values"].append(tree_structure["threshold"])
-
-    # Assume left is the true branch and right is the false branch
-    attrs["nodes_truenodeids"].append(left_id)
-    attrs["nodes_falsenodeids"].append(right_id)
-    if tree_structure["default_left"]:
-        if (
-            tree_structure["missing_type"] == "None"
-            and float(tree_structure["threshold"]) < 0.0
-        ):
-            attrs["nodes_missing_value_tracks_true"].append(0)
-        else:
-            attrs["nodes_missing_value_tracks_true"].append(1)
-    else:
-        attrs["nodes_missing_value_tracks_true"].append(0)
-    attrs["nodes_hitrates"].append(1.0)
-    if left_parse:
-        _parse_node(
-            tree_id,
-            class_id,
-            left_id,
-            node_id_pool,
-            node_pyid_pool,
-            learning_rate,
-            tree_structure["left_child"],
-            attrs,
-        )
-    if right_parse:
-        _parse_node(
-            tree_id,
-            class_id,
-            right_id,
-            node_id_pool,
-            node_pyid_pool,
-            learning_rate,
-            tree_structure["right_child"],
-            attrs,
-        )
-
-
-def _parse_node(
-    tree_id, class_id, node_id, node_id_pool, node_pyid_pool, learning_rate, node, attrs
-):
-    """
-    Parses nodes.
-    """
-    if (hasattr(node, "left_child") and hasattr(node, "right_child")) or (
-        "left_child" in node and "right_child" in node
-    ):
-        left_pyid = id(node["left_child"])
-        right_pyid = id(node["right_child"])
-
-        if left_pyid in node_pyid_pool:
-            left_id = node_pyid_pool[left_pyid]
-            left_parse = False
-        else:
-            left_id = _create_node_id(node_id_pool)
-            node_pyid_pool[left_pyid] = left_id
-            left_parse = True
-
-        if right_pyid in node_pyid_pool:
-            right_id = node_pyid_pool[right_pyid]
-            right_parse = False
-        else:
-            right_id = _create_node_id(node_id_pool)
-            node_pyid_pool[right_pyid] = right_id
-            right_parse = True
-
-        attrs["nodes_treeids"].append(tree_id)
-        attrs["nodes_nodeids"].append(node_id)
-
-        attrs["nodes_featureids"].append(node["split_feature"])
-        attrs["nodes_modes"].append(_translate_split_criterion(node["decision_type"]))
-        if isinstance(node["threshold"], str):
-            try:
-                attrs["nodes_values"].append(float(node["threshold"]))
-            except ValueError:
-                import pprint
-
-                text = pprint.pformat(node)
-                if len(text) > 100000:
-                    text = text[:100000] + "\n..."
-                raise TypeError(
-                    "threshold must be a number not '{}'"
-                    "\n{}".format(node["threshold"], text)
-                )
-        else:
-            attrs["nodes_values"].append(node["threshold"])
-
-        # Assume left is the true branch
-        # and right is the false branch
-        attrs["nodes_truenodeids"].append(left_id)
-        attrs["nodes_falsenodeids"].append(right_id)
-        if node["default_left"]:
-            if node["missing_type"] == "None" and float(node["threshold"]) < 0.0:
-                attrs["nodes_missing_value_tracks_true"].append(0)
+        # If there's a parent, record the child in the parent's data
+        if parent_idx is not None:
+            if is_true_branch:
+                nodes_truenodeids[parent_idx] = node_id
             else:
-                attrs["nodes_missing_value_tracks_true"].append(1)
-        else:
-            attrs["nodes_missing_value_tracks_true"].append(0)
-        attrs["nodes_hitrates"].append(1.0)
+                nodes_falsenodeids[parent_idx] = node_id
 
-        # Recursively dive into the child nodes
-        if left_parse:
-            _parse_node(
-                tree_id,
-                class_id,
-                left_id,
-                node_id_pool,
-                node_pyid_pool,
-                learning_rate,
-                node["left_child"],
-                attrs,
-            )
-        if right_parse:
-            _parse_node(
-                tree_id,
-                class_id,
-                right_id,
-                node_id_pool,
-                node_pyid_pool,
-                learning_rate,
-                node["right_child"],
-                attrs,
-            )
-    elif hasattr(node, "left_child") or hasattr(node, "right_child"):
-        raise ValueError("Need two branches")
-    else:
-        # Node attributes
-        attrs["nodes_treeids"].append(tree_id)
-        attrs["nodes_nodeids"].append(node_id)
-        attrs["nodes_featureids"].append(0)
-        attrs["nodes_modes"].append("LEAF")
-        # Leaf node has no threshold.
-        # A zero is appended but it will never be used.
-        attrs["nodes_values"].append(0.0)
-        # Leaf node has no child.
-        # A zero is appended but it will never be used.
-        attrs["nodes_truenodeids"].append(0)
-        # Leaf node has no child.
-        # A zero is appended but it will never be used.
-        attrs["nodes_falsenodeids"].append(0)
-        # Leaf node has no split function.
-        # A zero is appended but it will never be used.
-        attrs["nodes_missing_value_tracks_true"].append(0)
-        attrs["nodes_hitrates"].append(1.0)
+        # Initialize these in case this is a leaf
+        feature_id = 0
+        mode = "LEAF"
+        threshold_val = 0.0
+        true_child_id = 0
+        false_child_id = 0
+        missing_track_true = 0
+        hitrate = 1.0
 
-        # Leaf attributes
-        attrs["class_treeids"].append(tree_id)
-        attrs["class_nodeids"].append(node_id)
-        attrs["class_ids"].append(class_id)
-        attrs["class_weights"].append(float(node["leaf_value"]) * learning_rate)
+        # If it's a split node
+        if "split_feature" in node_dict and "threshold" in node_dict:
+            feature_id = node_dict["split_feature"]
+            mode = CRITERION_MAP.get(node_dict["decision_type"])
+
+            # Convert threshold to float
+            raw_threshold = node_dict["threshold"]
+            if isinstance(raw_threshold, str):
+                threshold_val = float(raw_threshold)
+            else:
+                threshold_val = raw_threshold
+
+            missing_track_true = 1 if node_dict.get("default_left", False) else 0
+
+        # Node
+        nodes_treeids.append(tree_id)
+        nodes_nodeids.append(node_id)
+        nodes_featureids.append(feature_id)
+        nodes_modes.append(mode)
+        nodes_values.append(threshold_val)
+        nodes_truenodeids.append(true_child_id)
+        nodes_falsenodeids.append(false_child_id)
+        nodes_missing_value_tracks_true.append(missing_track_true)
+        nodes_hitrates.append(hitrate)
+
+        this_idx = len(nodes_treeids) - 1
+        node_index_lookup[id(node_dict)] = this_idx
+
+        # If it’s a split node, enqueue children
+        if "left_child" in node_dict and "right_child" in node_dict:
+            queue.append((node_dict["left_child"], this_idx, True))
+            queue.append((node_dict["right_child"], this_idx, False))
+
+        # If it’s a leaf node
+        if mode == "LEAF":
+            class_treeids.append(tree_id)
+            class_nodeids.append(node_id)
+            class_ids.append(class_id)
+            leaf_val = float(node_dict["leaf_value"]) * learning_rate
+            class_weights.append(leaf_val)
+
+    return (
+        nodes_treeids, nodes_nodeids, nodes_featureids, nodes_modes, nodes_values,
+        nodes_truenodeids, nodes_falsenodeids, nodes_missing_value_tracks_true,
+        nodes_hitrates,
+        class_treeids, class_nodeids, class_ids, class_weights
+    )
 
 
 def dump_booster_model(
@@ -573,15 +431,66 @@ def convert_lightgbm(scope, operator, container):
             )
         )
 
-    # Use the same algorithm to parse the tree
-    for i, tree in enumerate(gbm_text["tree_info"]):
-        tree_id = i
-        class_id = tree_id % n_classes
-        # tree['shrinkage'] --> LightGbm provides figures with it already.
-        learning_rate = 1.0
-        _parse_tree_structure(
-            tree_id, class_id, learning_rate, tree["tree_structure"], attrs
-        )
+    tempTime = time.perf_counter()
+    
+	# Parse Trees
+    trees = gbm_text["tree_info"]
+    n_trees = len(trees)
+    results = [None]*n_trees
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = []
+        
+        for i, tree in enumerate(trees):
+            future = executor.submit(
+                _parse_single_tree,
+                tree["tree_structure"],
+                i, # tree_id
+                i % n_classes, # class_id
+                1.0 # learning rate
+            )
+            futures.append((i, future))
+
+        for i, future in futures:
+            results[i] = future.result()
+
+    # Merge Results
+    global_node_offset = 0
+
+    for i, result in enumerate(results):
+        (nodes_treeids, nodes_nodeids, nodes_featureids, nodes_modes, nodes_values,
+            nodes_truenodeids, nodes_falsenodeids, nodes_missing_value_tracks_true,
+            nodes_hitrates,
+            class_treeids, class_nodeids, class_ids, class_weights) = result
+
+        offset_nodeids = [nid + global_node_offset for nid in nodes_nodeids]
+        offset_truenode = [nid + global_node_offset for nid in nodes_truenodeids]
+        offset_falsenode = [nid + global_node_offset for nid in nodes_falsenodeids]
+
+        # Extend nodes
+        attrs["nodes_treeids"].extend(nodes_treeids)
+        attrs["nodes_nodeids"].extend(offset_nodeids)
+        attrs["nodes_featureids"].extend(nodes_featureids)
+        attrs["nodes_modes"].extend(nodes_modes)
+        attrs["nodes_values"].extend(nodes_values)
+        attrs["nodes_truenodeids"].extend(offset_truenode)
+        attrs["nodes_falsenodeids"].extend(offset_falsenode)
+        attrs["nodes_missing_value_tracks_true"].extend(nodes_missing_value_tracks_true)
+        attrs["nodes_hitrates"].extend(nodes_hitrates)
+    
+        # Leaves
+        offset_leafids = [nid + global_node_offset for nid in class_nodeids]
+
+        attrs["class_treeids"].extend(class_treeids)
+        attrs["class_nodeids"].extend(offset_leafids)
+        attrs["class_ids"].extend(class_ids)
+        attrs["class_weights"].extend(class_weights)
+
+        # Bump global offset by the number of nodes we just appended
+        global_node_offset += len(nodes_nodeids)
+
+    tempElapsed = str( timedelta( seconds = time.perf_counter() - tempTime ) );
+    print( f"A @ {tempElapsed}" )
 
     # Sort nodes_* attributes. For one tree, its node indexes
     # should appear in an ascent order in nodes_nodeids. Nodes
