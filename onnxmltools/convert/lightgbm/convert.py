@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from datetime import timedelta
+import time
 from uuid import uuid4
 import onnx
 import lightgbm
@@ -78,12 +80,25 @@ def convert(
             "Hummingbird is not installed. Please install hummingbird to use this feature: "
             "pip install hummingbird-ml"
         )
+    
     if isinstance(model, lightgbm.Booster):
+        tempTime = time.perf_counter()
         model = WrappedBooster(model)
+        tempElapsed = str( timedelta( seconds = time.perf_counter() - tempTime ) );
+        print( f"A @ {tempElapsed}" )
+    
     if name is None:
+        tempTime = time.perf_counter()
         name = str(uuid4().hex)
+        tempElapsed = str( timedelta( seconds = time.perf_counter() - tempTime ) );
+        print( f"B @ {tempElapsed}" )
 
+    tempTime = time.perf_counter()
     target_opset = target_opset if target_opset else get_maximum_opset_supported()
+    tempElapsed = str( timedelta( seconds = time.perf_counter() - tempTime ) );
+    print( f"C @ {tempElapsed}" )
+    
+    tempTime = time.perf_counter()
     topology = parse_lightgbm(
         model,
         initial_types,
@@ -93,10 +108,20 @@ def convert(
         zipmap=zipmap,
         split=split,
     )
+    tempElapsed = str( timedelta( seconds = time.perf_counter() - tempTime ) );
+    print( f"D @ {tempElapsed}" )
+
+    tempTime = time.perf_counter()
     topology.compile()
+    tempElapsed = str( timedelta( seconds = time.perf_counter() - tempTime ) );
+    print( f"E @ {tempElapsed}" )
+    
+    tempTime = time.perf_counter()
     onnx_ml_model = convert_topology(
         topology, name, doc_string, target_opset, targeted_onnx
     )
+    tempElapsed = str( timedelta( seconds = time.perf_counter() - tempTime ) );
+    print( f"F @ {tempElapsed}" )
 
     if without_onnx_ml:
         if zipmap:
